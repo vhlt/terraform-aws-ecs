@@ -1,0 +1,79 @@
+name: Terraform self-hosted runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - uat
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+
+jobs:
+  terraform:
+    name: 'Terraform Plan and Apply'
+    runs-on: tf-runner
+    timeout-minutes: 20
+
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      ACTION: ${{ github.event.inputs.action }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Fetch Secrets from AWS Secrets Manager
+        id: fetch-secrets
+        run: |
+          SECRET_NAME="$ENVIRONMENT-tfvars"
+          aws secretsmanager get-secret-value --secret-id $SECRET_NAME --query SecretString --output text > secret.json
+
+      - name: Convert JSON to TFVars
+        run: |
+          # Convert JSON to TFVars
+          jq -r 'to_entries | .[] | "\(.key) = \(.value | if type=="array" then tostring else @json end)"' secret.json > env/$ENVIRONMENT.tfvars
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.9.3
+
+      - name: Terraform Init
+        run: terraform init -upgrade --reconfigure -backend=true -backend-config=env/backend-$ENVIRONMENT.hcl
+
+      - name: Terraform Plan
+        if: ${{ env.ACTION == 'plan' }}
+        id: plan
+        run: terraform plan -out=plan-$ENVIRONMENT.tfplan -var-file=env/$ENVIRONMENT.tfvars
+
+      - name: Save Terraform Plan to Shared Storage
+        if: ${{ env.ACTION == 'plan' }}
+        run: |
+          sudo mkdir -p /shared/plans
+          sudo cp plan-$ENVIRONMENT.tfplan /shared/plans/plan-$ENVIRONMENT.tfplan
+
+      - name: Load Terraform Plan from Shared Storage
+        if: ${{ env.ACTION == 'apply' }}
+        run: |
+          sudo cp /shared/plans/plan-$ENVIRONMENT.tfplan .
+
+      - name: Terraform Apply
+        if: ${{ env.ACTION == 'apply' }}
+        run: terraform apply plan-$ENVIRONMENT.tfplan
